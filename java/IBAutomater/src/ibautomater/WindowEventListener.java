@@ -72,9 +72,12 @@ public class WindowEventListener implements AWTEventListener {
     private boolean restartNow = false;
     private Window viewLogsWindow = null;
 
-    private int twoFactorConfirmationAttempts = 0;
-    private final int maxTwoFactorConfirmationAttempts = 3;
-    
+    private final TwoFactorPolicy twoFactorPolicy;
+    private final ScheduledExecutorService twoFATimer = Executors.newSingleThreadScheduledExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "IBAutomater 2FA timeout");
+        thread.setDaemon(true);
+        return thread;
+    });
     private ScheduledFuture<?> twoFATimeoutFuture;
 
     /**
@@ -84,6 +87,11 @@ public class WindowEventListener implements AWTEventListener {
      */
     WindowEventListener(IBAutomater automater) {
         this.automater = automater;
+        this.twoFactorPolicy = new TwoFactorPolicy(
+                TwoFactorPolicy.DEFAULT_SLOW_RETRY_SECONDS,
+                TwoFactorPolicy.DEFAULT_RETRY_HOURS,
+                () -> System.nanoTime() / 1000000L,
+                automater::logMessage);
     }
 
     /**
@@ -874,7 +882,7 @@ public class WindowEventListener implements AWTEventListener {
         String title = Common.getTitle(window);
 
         if (title != null && title.equals("Re-login is required")) {
-            if (this.twoFactorConfirmationAttempts >= this.maxTwoFactorConfirmationAttempts) {
+            if (this.twoFactorPolicy.isPastFastAttempts()) {
                 this.automater.logMessage("Skipping Re-login, maximum attempts reached");
 
                 JButton cancel = Common.getButton(window, "Cancel");
@@ -1162,8 +1170,9 @@ public class WindowEventListener implements AWTEventListener {
 
     /**
      * Detects and handles the Two Factor Authentication window.
-     * - if the window is closed within 150 seconds since it was opened, 2FA confirmation was successful,
-     * otherwise it is considered a timeout and other two attempts to login are performed
+     * - Cancel is clicked 150 seconds after the window opened; a close we did not cause is a successful
+     * 2FA confirmation, whatever the elapsed time
+     * - after a timeout the login is retried as {@link TwoFactorPolicy} decides
      *
      * @param window The window instance
      * @param eventId The id of the window event
@@ -1211,68 +1220,59 @@ public class WindowEventListener implements AWTEventListener {
                 return true;
             }
             else if (eventId == WindowEvent.WINDOW_OPENED) {
-                this.twoFactorConfirmationAttempts++;
-                this.automater.logMessage("twoFactorConfirmationAttempts: " + this.twoFactorConfirmationAttempts + "/" + this.maxTwoFactorConfirmationAttempts);
-                
-                final ScheduledExecutorService executor = Executors.newScheduledThreadPool(1);
-                this.twoFATimeoutFuture = executor.schedule(() -> {
-                    try {                       
-                        this.automater.logMessage("Closing 2FA window after timeout");
+                final int attempt = this.twoFactorPolicy.onWindowOpened();
+
+                this.twoFATimeoutFuture = this.twoFATimer.schedule(() -> {
+                    try {
+                        if (!this.twoFactorPolicy.claimTimeoutCancel(attempt)) {
+                            return;
+                        }
                         String buttonText = "Cancel";
                         JButton button = Common.getButton(window, buttonText);
                         if (button != null) {
                             this.automater.logMessage("Click button: [" + buttonText + "]");
                             button.doClick();
                         }
+                        else {
+                            this.twoFactorPolicy.onTimeoutCancelNotFound();
+                        }
                     } catch (Exception e) {
                         // Shouldn't happen
                         this.automater.logMessage("Close 2FA window execute error: " + e.getMessage());
                         throw e;
                     }
-                }, 150, TimeUnit.SECONDS);
-                
+                }, TwoFactorPolicy.TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
                 return true;
             }
             else if (eventId == WindowEvent.WINDOW_CLOSED) {
-                if (this.twoFATimeoutFuture != null && this.twoFATimeoutFuture.isDone() && !this.twoFATimeoutFuture.isCancelled()) {
+                if (this.twoFATimeoutFuture != null) {
+                    this.twoFATimeoutFuture.cancel(false);
                     this.twoFATimeoutFuture = null;
-                    this.automater.logMessage("2FA confirmation timeout");
-                    if (this.twoFactorConfirmationAttempts >= this.maxTwoFactorConfirmationAttempts) {
-                        this.automater.logMessage("2FA maximum attempts reached");
-                    }
-                    else {
-                        this.automater.logMessage("New login attempt with 2FA");
-
-                        new Thread(()-> {
-                            try {
-                                int delay = 10000 * this.twoFactorConfirmationAttempts;
-
-                                // IB considers a 2FA timeout as a failed login attempt
-                                // so we wait before retrying to avoid the "Too many failed login attempts" error
-                                Thread.sleep(delay);
-
-                                // execute asynchronously on the AWT event dispatching thread
-                                SwingUtilities.invokeLater(() -> {
-                                    try {
-                                        Window mainWindow = automater.getMainWindow();
-                                        HandleLoginWindow(mainWindow, WindowEvent.WINDOW_OPENED);
-                                    } catch (Exception e) {
-                                        automater.logMessage("HandleLoginWindow error: " + e.getMessage());
-                                    }
-                                });
-                            } catch (Exception e) {
-                                automater.logMessage("HandleLoginWindow error: " + e.getMessage());
-                            }
-                        }).start();
-                    }
                 }
-                else {
-                    if (this.twoFATimeoutFuture != null) {
-                        this.twoFATimeoutFuture.cancel(true);
-                        this.twoFATimeoutFuture = null;
-                    }
-                    this.automater.logMessage("2FA confirmation success");
-                    this.twoFactorConfirmationAttempts = 0;
+
+                if (this.twoFactorPolicy.onWindowClosed() == TwoFactorPolicy.Outcome.RETRY) {
+                    final long delaySeconds = this.twoFactorPolicy.getRetryDelaySeconds();
+
+                    new Thread(()-> {
+                        try {
+                            // IB considers a 2FA timeout as a failed login attempt
+                            // so we wait before retrying to avoid the "Too many failed login attempts" error
+                            Thread.sleep(delaySeconds * 1000L);
+
+                            // execute asynchronously on the AWT event dispatching thread
+                            SwingUtilities.invokeLater(() -> {
+                                try {
+                                    Window mainWindow = automater.getMainWindow();
+                                    HandleLoginWindow(mainWindow, WindowEvent.WINDOW_OPENED);
+                                } catch (Exception e) {
+                                    automater.logMessage("HandleLoginWindow error: " + e.getMessage());
+                                }
+                            });
+                        } catch (Exception e) {
+                            automater.logMessage("HandleLoginWindow error: " + e.getMessage());
+                        }
+                    }).start();
                 }
                 return true;
             }
