@@ -16,6 +16,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -81,6 +82,9 @@ namespace QuantConnect.IBAutomater
 
         // used to limit logging
         private bool _isWithinScheduledServerResetTimesLastValue;
+
+        private TimeSpan _serverResetWindowStartEt = new TimeSpan(23, 30, 0);
+        private TimeSpan _serverResetWindowEndEt = new TimeSpan(1, 0, 0);
 
         private string _ibGatewayLogFileName;
         private int _logLinesRead;
@@ -285,6 +289,7 @@ namespace QuantConnect.IBAutomater
 
                 var ibGatewayVersionPath = GetIbGatewayVersionPath();
 
+                OutputDataReceived?.Invoke(this, new OutputDataReceivedEventArgs($"IBAutomater server reset window (America, New York time): {ServerResetWindowEt}"));
                 OutputDataReceived?.Invoke(this, new OutputDataReceivedEventArgs($"Loading IBGateway - Version: {_ibVersion} - Path: {ibGatewayVersionPath} - User: {_userName}"));
 
                 if (!Directory.Exists(ibGatewayVersionPath))
@@ -864,6 +869,35 @@ namespace QuantConnect.IBAutomater
         }
 
         /// <summary>
+        /// The America region's nightly server reset window in New York time, as "HH:mm-HH:mm";
+        /// the end may be past midnight and both bounds are exclusive.
+        /// Defaults to "23:30-01:00". A malformed value throws <see cref="ArgumentException"/>.
+        /// </summary>
+        public string ServerResetWindowEt
+        {
+            get
+            {
+                return $"{_serverResetWindowStartEt:hh\\:mm}-{_serverResetWindowEndEt:hh\\:mm}";
+            }
+            set
+            {
+                var parts = value?.Split('-');
+                if (parts == null || parts.Length != 2
+                    || !TimeSpan.TryParseExact(parts[0].Trim(), "hh\\:mm", CultureInfo.InvariantCulture, out var start)
+                    || !TimeSpan.TryParseExact(parts[1].Trim(), "hh\\:mm", CultureInfo.InvariantCulture, out var end)
+                    || start == end)
+                {
+                    throw new ArgumentException(
+                        $"Invalid server reset window '{value}': expected \"HH:mm-HH:mm\" in New York time, with a start different from its end",
+                        nameof(value));
+                }
+
+                _serverResetWindowStartEt = start;
+                _serverResetWindowEndEt = end;
+            }
+        }
+
+        /// <summary>
         /// This function is used to decide whether or not we should kill an algorithm
         /// when we lose contact with IB servers. IB performs server resets nightly
         /// and on Fridays they take everything down, so we'll prevent killing algos
@@ -871,11 +905,28 @@ namespace QuantConnect.IBAutomater
         /// </summary>
         public bool IsWithinScheduledServerResetTimes()
         {
+            var result = IsWithinScheduledServerResetTimes(DateTime.UtcNow);
+
+            if (result != _isWithinScheduledServerResetTimesLastValue)
+            {
+                _isWithinScheduledServerResetTimesLastValue = result;
+
+                OutputDataReceived?.Invoke(this, new OutputDataReceivedEventArgs(
+                    $"IBAutomater.IsWithinScheduledServerResetTimes(): {result}"));
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Returns whether the specified time is within the IB scheduled server reset times.
+        /// </summary>
+        public bool IsWithinScheduledServerResetTimes(DateTime utcTime)
+        {
             // Use schedule based on server region:
             // https://www.interactivebrokers.com/en/index.php?f=2225
 
             bool result;
-            var utcTime = DateTime.UtcNow;
             var newYorkTime = utcTime.ConvertFromUtc(TimeZoneNewYork);
             var newYorkTimeOfDay = newYorkTime.TimeOfDay;
 
@@ -916,19 +967,15 @@ namespace QuantConnect.IBAutomater
                     case Region.America:
                     default:
                         {
-                            // Saturday - Thursday: 23:45 - 00:45 ET
-                            result = newYorkTimeOfDay > new TimeSpan(23, 30, 0) || newYorkTimeOfDay < new TimeSpan(1, 0, 0);
+                            // Saturday - Thursday: 23:45 - 00:45 ET, by default with 15 minutes either side
+                            var start = _serverResetWindowStartEt;
+                            var end = _serverResetWindowEndEt;
+                            result = start < end
+                                ? newYorkTimeOfDay > start && newYorkTimeOfDay < end
+                                : newYorkTimeOfDay > start || newYorkTimeOfDay < end;
                         }
                         break;
                 }
-            }
-
-            if (result != _isWithinScheduledServerResetTimesLastValue)
-            {
-                _isWithinScheduledServerResetTimesLastValue = result;
-
-                OutputDataReceived?.Invoke(this, new OutputDataReceivedEventArgs(
-                    $"IBAutomater.IsWithinScheduledServerResetTimes(): {result}"));
             }
 
             return result;
