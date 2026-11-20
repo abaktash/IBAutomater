@@ -221,7 +221,10 @@ namespace QuantConnect.IBAutomater.Tests
             var culture = Thread.CurrentThread.CurrentCulture;
             try
             {
-                Thread.CurrentThread.CurrentCulture = new CultureInfo("de-DE");
+                var comma = (CultureInfo)CultureInfo.InvariantCulture.Clone();
+                comma.NumberFormat.NumberDecimalSeparator = ",";
+                Thread.CurrentThread.CurrentCulture = comma;
+                Assert.That(0.5.ToString(), Is.EqualTo("0,5"));
                 var automater = CreateAutomater();
                 automater.TwoFactorRetryHours = 0.5;
                 automater.TwoFactorRetrySlowSeconds = 120;
