@@ -87,9 +87,8 @@ public class WindowEventListener implements AWTEventListener {
      */
     WindowEventListener(IBAutomater automater) {
         this.automater = automater;
-        this.twoFactorPolicy = new TwoFactorPolicy(
-                TwoFactorPolicy.DEFAULT_SLOW_RETRY_SECONDS,
-                TwoFactorPolicy.DEFAULT_RETRY_HOURS,
+        this.twoFactorPolicy = TwoFactorPolicy.fromProperties(
+                System::getProperty,
                 () -> System.nanoTime() / 1000000L,
                 automater::logMessage);
     }
@@ -882,6 +881,10 @@ public class WindowEventListener implements AWTEventListener {
         String title = Common.getTitle(window);
 
         if (title != null && title.equals("Re-login is required")) {
+            if (this.twoFactorPolicy.onReloginRequired() == TwoFactorPolicy.Outcome.RETRY) {
+                this.scheduleLoginRetry(this.twoFactorPolicy.getRetryDelaySeconds());
+            }
+
             if (this.twoFactorPolicy.isPastFastAttempts()) {
                 this.automater.logMessage("Skipping Re-login, maximum attempts reached");
 
@@ -1170,8 +1173,9 @@ public class WindowEventListener implements AWTEventListener {
 
     /**
      * Detects and handles the Two Factor Authentication window.
-     * - Cancel is clicked 150 seconds after the window opened; a close we did not cause is a successful
-     * 2FA confirmation, whatever the elapsed time
+     * - Cancel is clicked 150 seconds after the window opened; a close we did not cause is held 5 seconds
+     * and is then a successful 2FA confirmation, whatever the elapsed time, unless a "Re-login is required"
+     * window opened inside the hold (IB's own expiry, a timeout)
      * - after a timeout the login is retried as {@link TwoFactorPolicy} decides
      *
      * @param window The window instance
@@ -1251,34 +1255,47 @@ public class WindowEventListener implements AWTEventListener {
                     this.twoFATimeoutFuture = null;
                 }
 
-                if (this.twoFactorPolicy.onWindowClosed() == TwoFactorPolicy.Outcome.RETRY) {
-                    final long delaySeconds = this.twoFactorPolicy.getRetryDelaySeconds();
-
-                    new Thread(()-> {
-                        try {
-                            // IB considers a 2FA timeout as a failed login attempt
-                            // so we wait before retrying to avoid the "Too many failed login attempts" error
-                            Thread.sleep(delaySeconds * 1000L);
-
-                            // execute asynchronously on the AWT event dispatching thread
-                            SwingUtilities.invokeLater(() -> {
-                                try {
-                                    Window mainWindow = automater.getMainWindow();
-                                    HandleLoginWindow(mainWindow, WindowEvent.WINDOW_OPENED);
-                                } catch (Exception e) {
-                                    automater.logMessage("HandleLoginWindow error: " + e.getMessage());
-                                }
-                            });
-                        } catch (Exception e) {
-                            automater.logMessage("HandleLoginWindow error: " + e.getMessage());
-                        }
-                    }).start();
+                TwoFactorPolicy.Outcome outcome = this.twoFactorPolicy.onWindowClosed();
+                if (outcome == TwoFactorPolicy.Outcome.HELD) {
+                    this.twoFATimer.schedule(
+                            () -> { this.twoFactorPolicy.onApprovalHoldElapsed(); },
+                            TwoFactorPolicy.APPROVAL_HOLD_SECONDS, TimeUnit.SECONDS);
+                }
+                else if (outcome == TwoFactorPolicy.Outcome.RETRY) {
+                    this.scheduleLoginRetry(this.twoFactorPolicy.getRetryDelaySeconds());
                 }
                 return true;
             }
         }
 
         return false;
+    }
+
+    /**
+     * Starts the login again after a 2FA timeout, once the delay has passed.
+     *
+     * @param delaySeconds The delay before the login, in seconds
+     */
+    private void scheduleLoginRetry(final long delaySeconds) {
+        new Thread(()-> {
+            try {
+                // IB considers a 2FA timeout as a failed login attempt
+                // so we wait before retrying to avoid the "Too many failed login attempts" error
+                Thread.sleep(delaySeconds * 1000L);
+
+                // execute asynchronously on the AWT event dispatching thread
+                SwingUtilities.invokeLater(() -> {
+                    try {
+                        Window mainWindow = automater.getMainWindow();
+                        HandleLoginWindow(mainWindow, WindowEvent.WINDOW_OPENED);
+                    } catch (Exception e) {
+                        automater.logMessage("HandleLoginWindow error: " + e.getMessage());
+                    }
+                });
+            } catch (Exception e) {
+                automater.logMessage("HandleLoginWindow error: " + e.getMessage());
+            }
+        }).start();
     }
 
     /**
