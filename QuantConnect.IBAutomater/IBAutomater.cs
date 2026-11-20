@@ -33,7 +33,10 @@ namespace QuantConnect.IBAutomater
     /// </summary>
     public class IBAutomater : IDisposable
     {
-        private readonly TimeSpan _initializationTimeout = TimeSpan.FromMinutes(15);
+        private readonly TimeSpan _initializationTimeout = InitializationWait.BaseTimeout;
+        private readonly InitializationWait _initializationWait;
+        private double _twoFactorRetryHours = 12;
+        private int _twoFactorRetrySlowSeconds = 300;
 
         private readonly string _ibDirectory;
         private readonly string _ibVersion;
@@ -195,6 +198,8 @@ namespace QuantConnect.IBAutomater
             _exportIbGatewayLogs = exportIbGatewayLogs;
 
             _timerLogReader = new Timer(LogReaderTimerCallback, null, Timeout.Infinite, Timeout.Infinite);
+            _initializationWait = new InitializationWait(() => DateTime.UtcNow,
+                text => OutputDataReceived?.Invoke(this, new OutputDataReceivedEventArgs(text)));
 
             Restarted += (sender, e) =>
             {
@@ -290,6 +295,7 @@ namespace QuantConnect.IBAutomater
                 var ibGatewayVersionPath = GetIbGatewayVersionPath();
 
                 OutputDataReceived?.Invoke(this, new OutputDataReceivedEventArgs($"IBAutomater server reset window (America, New York time): {ServerResetWindowEt}"));
+                OutputDataReceived?.Invoke(this, new OutputDataReceivedEventArgs(TwoFactorPolicyLine()));
                 OutputDataReceived?.Invoke(this, new OutputDataReceivedEventArgs($"Loading IBGateway - Version: {_ibVersion} - Path: {ibGatewayVersionPath} - User: {_userName}"));
 
                 if (!Directory.Exists(ibGatewayVersionPath))
@@ -330,7 +336,7 @@ namespace QuantConnect.IBAutomater
                 _timerLogReader.Change(TimeSpan.Zero, TimeSpan.FromSeconds(1));
 
                 string fileName;
-                var arguments = $"-J-DjtsConfigDir={ibGatewayVersionPath}";
+                var arguments = $"-J-DjtsConfigDir={ibGatewayVersionPath} {TwoFactorJvmArguments()}";
                 var ibGatewayExecutablePath = GetIbGatewayExecutablePath();
                 if (IsWindows)
                 {
@@ -375,6 +381,11 @@ namespace QuantConnect.IBAutomater
                 process.ErrorDataReceived += SendErrorLog;
                 process.Exited += OnProcessExited;
 
+                if (!waitForExit)
+                {
+                    _initializationWait.Begin(_twoFactorRetryHours);
+                }
+
                 try
                 {
                     var started = process.Start();
@@ -405,7 +416,7 @@ namespace QuantConnect.IBAutomater
                 {
                     // wait for completion of IBGateway login and configuration
                     string message;
-                    if (_ibAutomaterInitializeEvent.WaitOne(_initializationTimeout))
+                    if (_initializationWait.Wait(timeout => _ibAutomaterInitializeEvent.WaitOne(timeout)))
                     {
                         var processName = IsWindows ? Path.GetFileNameWithoutExtension(fileName) : "java";
                         var p = Process.GetProcessesByName(processName).FirstOrDefault();
@@ -514,11 +525,13 @@ namespace QuantConnect.IBAutomater
             }
         }
 
-        private void OnProcessOutputDataReceived(string text)
+        internal void OnProcessOutputDataReceived(string text)
         {
             if (text != null)
             {
                 OutputDataReceived?.Invoke(this, new OutputDataReceivedEventArgs(text));
+
+                _initializationWait.OnLine(text);
 
                 // login failed
                 if (text.Contains("Login failed", StringComparison.InvariantCultureIgnoreCase))
@@ -866,6 +879,64 @@ namespace QuantConnect.IBAutomater
         public StartResult GetLastStartResult()
         {
             return _lastStartResult;
+        }
+
+        /// <summary>
+        /// How long, in hours, the Java agent keeps asking for 2FA after its third timeout (one request every
+        /// <see cref="TwoFactorRetrySlowSeconds"/>), and how far past its first 15 minutes 2FA progress may keep
+        /// <see cref="Start(bool)"/> waiting. 0 is upstream's behaviour: three requests, one 15-minute wait.
+        /// Defaults to 12; a value outside 0 to 24 throws <see cref="ArgumentException"/>.
+        /// </summary>
+        public double TwoFactorRetryHours
+        {
+            get
+            {
+                return _twoFactorRetryHours;
+            }
+            set
+            {
+                if (!(value >= 0 && value <= 24))
+                {
+                    throw new ArgumentException($"Invalid 2FA retry hours '{value.ToString(CultureInfo.InvariantCulture)}': expected 0 to 24", nameof(value));
+                }
+
+                _twoFactorRetryHours = value;
+            }
+        }
+
+        /// <summary>
+        /// The seconds between the Java agent's 2FA requests after its third timeout.
+        /// Defaults to 300; a value outside 60 to 3600 throws <see cref="ArgumentException"/>.
+        /// </summary>
+        public int TwoFactorRetrySlowSeconds
+        {
+            get
+            {
+                return _twoFactorRetrySlowSeconds;
+            }
+            set
+            {
+                if (value < 60 || value > 3600)
+                {
+                    throw new ArgumentException($"Invalid 2FA slow retry seconds '{value}': expected 60 to 3600", nameof(value));
+                }
+
+                _twoFactorRetrySlowSeconds = value;
+            }
+        }
+
+        internal string TwoFactorPolicyLine()
+        {
+            var hours = _twoFactorRetryHours.ToString(CultureInfo.InvariantCulture);
+            var capMinutes = (InitializationWait.BaseTimeout.TotalMinutes + _twoFactorRetryHours * 60).ToString("0.#", CultureInfo.InvariantCulture);
+            return $"IBAutomater 2FA policy: retry-hours={hours} slow-seconds={_twoFactorRetrySlowSeconds} " +
+                $"initialization-wait={InitializationWait.BaseTimeout.TotalMinutes:0} min, extended while 2FA continues, cap {capMinutes} min";
+        }
+
+        internal string TwoFactorJvmArguments()
+        {
+            return $"-J-Dibautomater.twofa.retryHours={_twoFactorRetryHours.ToString(CultureInfo.InvariantCulture)} " +
+                $"-J-Dibautomater.twofa.slowRetrySeconds={_twoFactorRetrySlowSeconds.ToString(CultureInfo.InvariantCulture)}";
         }
 
         /// <summary>
